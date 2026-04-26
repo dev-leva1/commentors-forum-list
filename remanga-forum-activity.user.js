@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ReManga Forum Activity List
 // @namespace    https://remanga.org/
-// @version      1.0.6
+// @version      1.0.7
 // @description  Показывает уникальных комментаторов и лайкнувших под постом форума ReManga. Кнопка закреплена в правом нижнем углу.
 // @match        https://remanga.org/forum/*
 // @updateURL    https://raw.githubusercontent.com/dev-leva1/commentors-forum-list/main/remanga-forum-activity.user.js
@@ -510,6 +510,7 @@
       this.panel = null;
       this.overlay = null;
       this.closeButton = null;
+      this.copyAllButton = null;
       this.tabButtons = new Map();
       this.countElements = new Map();
       this.list = null;
@@ -517,6 +518,7 @@
       this.title = null;
       this.data = null;
       this.isOpen = false;
+      this.statusResetTimer = null;
       this.handleDocumentClick = this.handleDocumentClick.bind(this);
       this.handleEscape = this.handleEscape.bind(this);
     }
@@ -594,11 +596,21 @@
       refreshButton.textContent = 'Обновить';
       refreshButton.addEventListener('click', () => onRefresh());
 
+      this.copyAllButton = document.createElement('button');
+      this.copyAllButton.type = 'button';
+      this.copyAllButton.className = 'rmfa-copy-all';
+      this.copyAllButton.textContent = 'Скопировать все';
+      this.copyAllButton.addEventListener('click', () => this.copyAllCurrentModeUsers());
+
+      const toolbarActions = document.createElement('div');
+      toolbarActions.className = 'rmfa-toolbar-actions';
+      toolbarActions.append(this.copyAllButton, refreshButton);
+
       this.status = document.createElement('div');
       this.status.className = 'rmfa-status';
       this.status.textContent = 'Загрузка...';
 
-      toolbar.append(this.status, refreshButton);
+      toolbar.append(this.status, toolbarActions);
 
       this.list = document.createElement('div');
       this.list.className = 'rmfa-list';
@@ -627,22 +639,30 @@
       this.panel = null;
       this.overlay = null;
       this.closeButton = null;
+      this.copyAllButton = null;
       this.list = null;
       this.status = null;
       this.title = null;
       this.data = null;
       this.isOpen = false;
+      window.clearTimeout(this.statusResetTimer);
+      this.statusResetTimer = null;
       this.tabButtons.clear();
       this.countElements.clear();
     }
 
     setLoading() {
       this.data = null;
+      window.clearTimeout(this.statusResetTimer);
+      this.statusResetTimer = null;
       if (this.status) {
         this.status.textContent = 'Загрузка...';
       }
       if (this.list) {
         this.list.innerHTML = '';
+      }
+      if (this.copyAllButton) {
+        this.copyAllButton.disabled = true;
       }
       for (const count of this.countElements.values()) {
         count.textContent = '0';
@@ -650,6 +670,11 @@
     }
 
     setError(message) {
+      window.clearTimeout(this.statusResetTimer);
+      this.statusResetTimer = null;
+      if (this.copyAllButton) {
+        this.copyAllButton.disabled = true;
+      }
       if (this.status) {
         this.status.textContent = message;
       }
@@ -660,6 +685,9 @@
 
     setData(data) {
       this.data = data;
+      if (this.copyAllButton) {
+        this.copyAllButton.disabled = false;
+      }
       this.countElements.get(MODES.comments).textContent = String(data.comments.length);
       this.countElements.get(MODES.likes).textContent = String(data.likes.length);
       this.countElements.get(MODES.intersection).textContent = String(data.intersection.length);
@@ -674,6 +702,58 @@
       this.renderCurrentMode();
     }
 
+    getCurrentModeUsers() {
+      const mode = this.settingsStore.getMode();
+      return this.data?.[mode] || [];
+    }
+
+    async copyAllCurrentModeUsers() {
+      const users = this.getCurrentModeUsers();
+      if (users.length === 0) {
+        this.showTemporaryStatus('Список пуст.');
+        return;
+      }
+
+      await this.copyText(users.map((user) => user.username).join('\n'), `Скопировано: ${users.length}`);
+    }
+
+    async copyUser(username) {
+      await this.copyText(username, `Скопировано: ${username}`);
+    }
+
+    async copyText(value, successMessage) {
+      try {
+        await navigator.clipboard.writeText(value);
+        this.showTemporaryStatus(successMessage);
+      } catch (error) {
+        console.warn('[RMFA] Ошибка копирования', error);
+        this.showTemporaryStatus('Не удалось скопировать.');
+      }
+    }
+
+    showTemporaryStatus(message) {
+      window.clearTimeout(this.statusResetTimer);
+      this.statusResetTimer = null;
+
+      if (!this.status) {
+        return;
+      }
+
+      this.status.textContent = message;
+      if (!this.data) {
+        return;
+      }
+
+      this.statusResetTimer = window.setTimeout(() => {
+        if (!this.status) {
+          return;
+        }
+
+        this.status.textContent = `Пользователей: ${this.getCurrentModeUsers().length}`;
+        this.statusResetTimer = null;
+      }, 2000);
+    }
+
     renderCurrentMode() {
       const mode = this.settingsStore.getMode();
       if (!this.data || !this.list || !this.status) {
@@ -683,6 +763,9 @@
       const users = this.data[mode] || [];
       this.status.textContent = `Пользователей: ${users.length}`;
       this.list.innerHTML = '';
+      if (this.copyAllButton) {
+        this.copyAllButton.disabled = users.length === 0;
+      }
 
       if (users.length === 0) {
         this.list.innerHTML = '<div class="rmfa-empty">Список пуст.</div>';
@@ -691,8 +774,11 @@
 
       const fragment = document.createDocumentFragment();
       for (const user of users) {
+        const item = document.createElement('div');
+        item.className = 'rmfa-user';
+
         const link = document.createElement('a');
-        link.className = 'rmfa-user';
+        link.className = 'rmfa-user-link';
         link.href = user.profileUrl;
         link.target = '_blank';
         link.rel = 'noreferrer noopener';
@@ -714,7 +800,15 @@
         name.textContent = user.username;
 
         link.append(avatar, name);
-        fragment.append(link);
+
+        const copyButton = document.createElement('button');
+        copyButton.type = 'button';
+        copyButton.className = 'rmfa-copy-user';
+        copyButton.textContent = 'Копировать';
+        copyButton.addEventListener('click', () => this.copyUser(user.username));
+
+        item.append(link, copyButton);
+        fragment.append(item);
       }
 
       this.list.append(fragment);
@@ -862,6 +956,14 @@
           gap: 12px;
         }
 
+        .rmfa-toolbar-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }
+
         .rmfa-title {
           font-size: 16px;
           font-weight: 700;
@@ -869,6 +971,8 @@
 
         .rmfa-close,
         .rmfa-refresh,
+        .rmfa-copy-all,
+        .rmfa-copy-user,
         .rmfa-tab {
           border: 0;
           background: rgba(255, 255, 255, 0.08);
@@ -910,9 +1014,47 @@
           opacity: 0.92;
         }
 
-        .rmfa-refresh {
+        .rmfa-refresh,
+        .rmfa-copy-all,
+        .rmfa-copy-user {
           border-radius: 10px;
           padding: 8px 12px;
+        }
+
+        .rmfa-copy-all:disabled {
+          opacity: 0.5;
+          cursor: default;
+        }
+
+        .rmfa-copy-user {
+          flex-shrink: 0;
+        }
+
+        .rmfa-copy-user:hover,
+        .rmfa-copy-all:hover,
+        .rmfa-refresh:hover,
+        .rmfa-close:hover {
+          background: rgba(255, 255, 255, 0.14);
+        }
+
+        .rmfa-copy-user:focus-visible,
+        .rmfa-copy-all:focus-visible,
+        .rmfa-refresh:focus-visible,
+        .rmfa-close:focus-visible,
+        .rmfa-tab:focus-visible,
+        .${BUTTON_CLASS}:focus-visible {
+          outline: 2px solid #7ea0ff;
+          outline-offset: 2px;
+        }
+
+        .rmfa-user-link {
+          min-width: 0;
+          flex: 1;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          text-decoration: none;
+          color: inherit;
         }
 
         .rmfa-status {
@@ -935,13 +1077,23 @@
           gap: 10px;
           padding: 10px 12px;
           border-radius: 12px;
-          text-decoration: none;
-          color: inherit;
           background: rgba(255, 255, 255, 0.05);
         }
 
         .rmfa-user:hover {
           background: rgba(255, 255, 255, 0.1);
+        }
+
+        .rmfa-user-link:hover .rmfa-username {
+          text-decoration: underline;
+        }
+
+        .rmfa-user-link:focus-visible {
+          outline: none;
+        }
+
+        .rmfa-user-link:focus-visible .rmfa-username {
+          text-decoration: underline;
         }
 
         .rmfa-avatar {
@@ -998,6 +1150,31 @@
 
           .rmfa-tabs {
             grid-template-columns: 1fr;
+          }
+
+          .rmfa-toolbar {
+            align-items: flex-start;
+            flex-direction: column;
+          }
+
+          .rmfa-toolbar-actions {
+            width: 100%;
+            justify-content: stretch;
+          }
+
+          .rmfa-copy-all,
+          .rmfa-refresh,
+          .rmfa-copy-user {
+            flex: 1;
+          }
+
+          .rmfa-user {
+            align-items: flex-start;
+            flex-direction: column;
+          }
+
+          .rmfa-user-link {
+            width: 100%;
           }
 
           .${ROOT_CLASS} {
