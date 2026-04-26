@@ -4,6 +4,8 @@
 // @version      1.0.6
 // @description  Показывает уникальных комментаторов и лайкнувших под постом форума ReManga. Кнопка закреплена в правом нижнем углу.
 // @match        https://remanga.org/forum/*
+// @updateURL    https://raw.githubusercontent.com/dev-leva1/commentors-forum-list/main/remanga-forum-activity.user.js
+// @downloadURL  https://raw.githubusercontent.com/dev-leva1/commentors-forum-list/main/remanga-forum-activity.user.js
 // @grant        GM_xmlhttpRequest
 // @connect      api.remanga.org
 // @connect      remanga.org
