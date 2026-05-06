@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ReManga Forum Activity List
 // @namespace    https://remanga.org/
-// @version      1.0.7
+// @version      1.0.8
 // @description  Показывает уникальных комментаторов и лайкнувших под постом форума ReManga. Кнопка закреплена в правом нижнем углу.
 // @match        https://remanga.org/forum/*
 // @updateURL    https://raw.githubusercontent.com/dev-leva1/commentors-forum-list/main/remanga-forum-activity.user.js
@@ -22,7 +22,10 @@
     dialog: '[role="dialog"], [aria-modal="true"]',
   };
 
-  const STORAGE_KEY = 'rm_forum_activity_mode';
+  const STORAGE_KEYS = Object.freeze({
+    mode: 'rm_forum_activity_mode',
+    subscriptionProfiles: 'rm_forum_activity_subscription_profiles',
+  });
   const MODES = Object.freeze({
     comments: 'comments',
     likes: 'likes',
@@ -34,9 +37,75 @@
   const ROOT_CLASS = 'rmfa-root';
   const STYLE_ID = 'rmfa-styles';
 
+  class ProfileInputParser {
+    parse(value) {
+      if (typeof value !== 'string' || !value.trim()) {
+        return {
+          ids: [],
+          invalidCount: 0,
+        };
+      }
+
+      const ids = [];
+      const seen = new Set();
+      let invalidCount = 0;
+      const parts = value.split(/[\s,;]+/).map((part) => part.trim()).filter(Boolean);
+
+      for (const part of parts) {
+        const id = this.parseProfileId(part);
+        if (!id) {
+          invalidCount += 1;
+          continue;
+        }
+
+        if (!seen.has(id)) {
+          seen.add(id);
+          ids.push(id);
+        }
+      }
+
+      return {
+        ids,
+        invalidCount,
+      };
+    }
+
+    parseProfileId(value) {
+      if (/^\d+$/.test(value)) {
+        return this.normalizeId(value);
+      }
+
+      const relativeMatch = value.match(/^\/user\/(\d+)\/about\/?$/i);
+      if (relativeMatch) {
+        return this.normalizeId(relativeMatch[1]);
+      }
+
+      try {
+        const url = new URL(value);
+        if (url.protocol !== 'https:' || url.hostname !== 'remanga.org') {
+          return null;
+        }
+
+        const match = url.pathname.match(/^\/user\/(\d+)\/about\/?$/i);
+        return match ? this.normalizeId(match[1]) : null;
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    normalizeId(value) {
+      const id = Number(value);
+      return Number.isSafeInteger(id) && id > 0 ? id : null;
+    }
+  }
+
   class SettingsStore {
+    constructor(profileInputParser = new ProfileInputParser()) {
+      this.profileInputParser = profileInputParser;
+    }
+
     getMode() {
-      const value = window.localStorage.getItem(STORAGE_KEY);
+      const value = window.localStorage.getItem(STORAGE_KEYS.mode);
       return Object.values(MODES).includes(value) ? value : MODES.comments;
     }
 
@@ -45,7 +114,19 @@
         return;
       }
 
-      window.localStorage.setItem(STORAGE_KEY, mode);
+      window.localStorage.setItem(STORAGE_KEYS.mode, mode);
+    }
+
+    getSubscriptionProfilesInput() {
+      return window.localStorage.getItem(STORAGE_KEYS.subscriptionProfiles) || '';
+    }
+
+    setSubscriptionProfilesInput(value) {
+      window.localStorage.setItem(STORAGE_KEYS.subscriptionProfiles, typeof value === 'string' ? value : '');
+    }
+
+    getSubscriptionProfileParseResult() {
+      return this.profileInputParser.parse(this.getSubscriptionProfilesInput());
     }
   }
 
@@ -124,6 +205,42 @@
 
         for (const entry of items) {
           const user = this.normalizeUser(entry?.user);
+          if (user) {
+            users.set(user.id, user);
+          }
+        }
+
+        if (!response?.next || items.length === 0) {
+          break;
+        }
+
+        page = this.parseNextPage(response.next, page);
+      }
+
+      return Array.from(users.values());
+    }
+
+    async fetchFollowers(profileId) {
+      const id = Number(profileId);
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        throw new Error('Invalid profile id');
+      }
+
+      const users = new Map();
+      const baseUrl = new URL('https://api.remanga.org/api/v2/users/followers/');
+      baseUrl.searchParams.set('count', '50');
+      baseUrl.searchParams.set('id', String(id));
+      baseUrl.searchParams.set('sub_type', 'author_users');
+      let page = 1;
+
+      while (page) {
+        const requestUrl = new URL(baseUrl.toString());
+        requestUrl.searchParams.set('page', String(page));
+        const response = await this.requestJson(requestUrl.toString());
+        const items = Array.isArray(response?.results) ? response.results : [];
+
+        for (const entry of items) {
+          const user = this.normalizeUser(entry);
           if (user) {
             users.set(user.id, user);
           }
@@ -235,7 +352,11 @@
         return null;
       }
 
-      return path.startsWith('http') ? path : `https://remanga.org${path}`;
+      if (path.startsWith('http')) {
+        return path;
+      }
+
+      return path.startsWith('/') ? `https://remanga.org${path}` : `https://remanga.org/${path}`;
     }
   }
 
@@ -447,13 +568,63 @@
     }
   }
 
-  class UserActivityService {
-    constructor(apiClient, domFallbackClient) {
+  class SubscriptionFilterService {
+    constructor(apiClient) {
       this.apiClient = apiClient;
-      this.domFallbackClient = domFallbackClient;
     }
 
-    async load(article, slug, postId) {
+    async filterData(data, profileIds) {
+      const ids = this.normalizeProfileIds(profileIds);
+      if (ids.length === 0) {
+        return data;
+      }
+
+      const followerSets = await Promise.all(ids.map((id) => this.loadFollowerIds(id)));
+      return {
+        comments: this.filterUsers(data.comments, followerSets),
+        likes: this.filterUsers(data.likes, followerSets),
+        intersection: this.filterUsers(data.intersection, followerSets),
+      };
+    }
+
+    normalizeProfileIds(profileIds) {
+      if (!Array.isArray(profileIds)) {
+        return [];
+      }
+
+      const seen = new Set();
+      const ids = [];
+      for (const value of profileIds) {
+        const id = Number(value);
+        if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) {
+          continue;
+        }
+
+        seen.add(id);
+        ids.push(id);
+      }
+
+      return ids;
+    }
+
+    async loadFollowerIds(profileId) {
+      const users = await this.apiClient.fetchFollowers(profileId);
+      return new Set(users.map((user) => user.id));
+    }
+
+    filterUsers(users, followerSets) {
+      return users.filter((user) => followerSets.every((followers) => followers.has(user.id)));
+    }
+  }
+
+  class UserActivityService {
+    constructor(apiClient, domFallbackClient, subscriptionFilterService) {
+      this.apiClient = apiClient;
+      this.domFallbackClient = domFallbackClient;
+      this.subscriptionFilterService = subscriptionFilterService;
+    }
+
+    async load(article, slug, postId, subscriptionProfileIds = []) {
       const [commentUsers, likeUsers] = await Promise.all([
         this.loadComments(article, postId),
         this.loadLikes(article, slug),
@@ -469,10 +640,21 @@
         }
       }
 
-      return {
+      const data = {
         comments: this.sortUsers(commentUsers),
         likes: this.sortUsers(likeUsers),
         intersection: this.sortUsers(intersection),
+      };
+
+      if (!this.subscriptionFilterService) {
+        return data;
+      }
+
+      const filteredData = await this.subscriptionFilterService.filterData(data, subscriptionProfileIds);
+      return {
+        comments: this.sortUsers(filteredData.comments),
+        likes: this.sortUsers(filteredData.likes),
+        intersection: this.sortUsers(filteredData.intersection),
       };
     }
 
@@ -511,6 +693,9 @@
       this.overlay = null;
       this.closeButton = null;
       this.copyAllButton = null;
+      this.applyFilterButton = null;
+      this.subscriptionInput = null;
+      this.filterStatus = null;
       this.tabButtons = new Map();
       this.countElements = new Map();
       this.list = null;
@@ -594,13 +779,50 @@
       refreshButton.type = 'button';
       refreshButton.className = 'rmfa-refresh';
       refreshButton.textContent = 'Обновить';
-      refreshButton.addEventListener('click', () => onRefresh());
+      refreshButton.addEventListener('click', () => {
+        this.saveSubscriptionProfilesInput();
+        onRefresh();
+      });
 
       this.copyAllButton = document.createElement('button');
       this.copyAllButton.type = 'button';
       this.copyAllButton.className = 'rmfa-copy-all';
       this.copyAllButton.textContent = 'Скопировать все';
       this.copyAllButton.addEventListener('click', () => this.copyAllCurrentModeUsers());
+
+      const filter = document.createElement('div');
+      filter.className = 'rmfa-filter';
+
+      const filterLabel = document.createElement('label');
+      filterLabel.className = 'rmfa-filter-label';
+      filterLabel.textContent = 'Профили для фильтра';
+      filterLabel.setAttribute('for', 'rmfa-subscription-profiles');
+
+      this.subscriptionInput = document.createElement('textarea');
+      this.subscriptionInput.id = 'rmfa-subscription-profiles';
+      this.subscriptionInput.className = 'rmfa-filter-input';
+      this.subscriptionInput.rows = 3;
+      this.subscriptionInput.spellcheck = false;
+      this.subscriptionInput.placeholder = 'https://remanga.org/user/2676440/about';
+      this.subscriptionInput.value = this.settingsStore.getSubscriptionProfilesInput();
+
+      const filterActions = document.createElement('div');
+      filterActions.className = 'rmfa-filter-actions';
+
+      this.filterStatus = document.createElement('div');
+      this.filterStatus.className = 'rmfa-filter-status';
+
+      this.applyFilterButton = document.createElement('button');
+      this.applyFilterButton.type = 'button';
+      this.applyFilterButton.className = 'rmfa-apply-filter';
+      this.applyFilterButton.textContent = 'Применить';
+      this.applyFilterButton.addEventListener('click', () => {
+        this.saveSubscriptionProfilesInput();
+        onRefresh();
+      });
+
+      filterActions.append(this.filterStatus, this.applyFilterButton);
+      filter.append(filterLabel, this.subscriptionInput, filterActions);
 
       const toolbarActions = document.createElement('div');
       toolbarActions.className = 'rmfa-toolbar-actions';
@@ -615,7 +837,7 @@
       this.list = document.createElement('div');
       this.list.className = 'rmfa-list';
 
-      this.panel.append(header, tabs, toolbar, this.list);
+      this.panel.append(header, tabs, filter, toolbar, this.list);
       this.root.append(trigger, this.overlay, this.panel);
       this.root.dataset.open = 'false';
       this.overlay.hidden = true;
@@ -623,6 +845,7 @@
       mountTarget.append(this.root);
 
       this.setMode(this.settingsStore.getMode());
+      this.updateFilterStatus();
       document.addEventListener('click', this.handleDocumentClick);
       document.addEventListener('keydown', this.handleEscape);
     }
@@ -640,6 +863,9 @@
       this.overlay = null;
       this.closeButton = null;
       this.copyAllButton = null;
+      this.applyFilterButton = null;
+      this.subscriptionInput = null;
+      this.filterStatus = null;
       this.list = null;
       this.status = null;
       this.title = null;
@@ -664,6 +890,9 @@
       if (this.copyAllButton) {
         this.copyAllButton.disabled = true;
       }
+      if (this.applyFilterButton) {
+        this.applyFilterButton.disabled = true;
+      }
       for (const count of this.countElements.values()) {
         count.textContent = '0';
       }
@@ -674,6 +903,9 @@
       this.statusResetTimer = null;
       if (this.copyAllButton) {
         this.copyAllButton.disabled = true;
+      }
+      if (this.applyFilterButton) {
+        this.applyFilterButton.disabled = false;
       }
       if (this.status) {
         this.status.textContent = message;
@@ -688,6 +920,10 @@
       if (this.copyAllButton) {
         this.copyAllButton.disabled = false;
       }
+      if (this.applyFilterButton) {
+        this.applyFilterButton.disabled = false;
+      }
+      this.updateFilterStatus();
       this.countElements.get(MODES.comments).textContent = String(data.comments.length);
       this.countElements.get(MODES.likes).textContent = String(data.likes.length);
       this.countElements.get(MODES.intersection).textContent = String(data.intersection.length);
@@ -700,6 +936,33 @@
         button.dataset.active = String(itemMode === mode);
       }
       this.renderCurrentMode();
+    }
+
+    saveSubscriptionProfilesInput() {
+      const value = this.subscriptionInput ? this.subscriptionInput.value : '';
+      this.settingsStore.setSubscriptionProfilesInput(value);
+      this.updateFilterStatus();
+    }
+
+    updateFilterStatus() {
+      if (!this.filterStatus) {
+        return;
+      }
+
+      const input = this.settingsStore.getSubscriptionProfilesInput();
+      const result = this.settingsStore.getSubscriptionProfileParseResult();
+      if (!input.trim()) {
+        this.filterStatus.textContent = 'Фильтр выключен';
+        return;
+      }
+
+      if (result.ids.length === 0) {
+        this.filterStatus.textContent = 'Нет валидных профилей';
+        return;
+      }
+
+      const skipped = result.invalidCount > 0 ? `, пропущено: ${result.invalidCount}` : '';
+      this.filterStatus.textContent = `Профилей: ${result.ids.length}${skipped}`;
     }
 
     getCurrentModeUsers() {
@@ -964,6 +1227,51 @@
           justify-content: flex-end;
         }
 
+        .rmfa-filter {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .rmfa-filter-label {
+          color: rgba(244, 246, 251, 0.86);
+          font-size: 13px;
+          font-weight: 700;
+        }
+
+        .rmfa-filter-input {
+          width: 100%;
+          min-height: 76px;
+          max-height: 140px;
+          resize: vertical;
+          box-sizing: border-box;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 10px;
+          background: rgba(255, 255, 255, 0.06);
+          color: inherit;
+          padding: 10px 12px;
+          font: inherit;
+          font-size: 13px;
+          line-height: 1.4;
+        }
+
+        .rmfa-filter-input::placeholder {
+          color: rgba(244, 246, 251, 0.42);
+        }
+
+        .rmfa-filter-actions {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+        }
+
+        .rmfa-filter-status {
+          min-width: 0;
+          color: rgba(244, 246, 251, 0.72);
+          font-size: 12px;
+        }
+
         .rmfa-title {
           font-size: 16px;
           font-weight: 700;
@@ -971,6 +1279,7 @@
 
         .rmfa-close,
         .rmfa-refresh,
+        .rmfa-apply-filter,
         .rmfa-copy-all,
         .rmfa-copy-user,
         .rmfa-tab {
@@ -1015,13 +1324,15 @@
         }
 
         .rmfa-refresh,
+        .rmfa-apply-filter,
         .rmfa-copy-all,
         .rmfa-copy-user {
           border-radius: 10px;
           padding: 8px 12px;
         }
 
-        .rmfa-copy-all:disabled {
+        .rmfa-copy-all:disabled,
+        .rmfa-apply-filter:disabled {
           opacity: 0.5;
           cursor: default;
         }
@@ -1033,6 +1344,7 @@
         .rmfa-copy-user:hover,
         .rmfa-copy-all:hover,
         .rmfa-refresh:hover,
+        .rmfa-apply-filter:hover,
         .rmfa-close:hover {
           background: rgba(255, 255, 255, 0.14);
         }
@@ -1040,6 +1352,8 @@
         .rmfa-copy-user:focus-visible,
         .rmfa-copy-all:focus-visible,
         .rmfa-refresh:focus-visible,
+        .rmfa-apply-filter:focus-visible,
+        .rmfa-filter-input:focus-visible,
         .rmfa-close:focus-visible,
         .rmfa-tab:focus-visible,
         .${BUTTON_CLASS}:focus-visible {
@@ -1162,8 +1476,14 @@
             justify-content: stretch;
           }
 
+          .rmfa-filter-actions {
+            align-items: stretch;
+            flex-direction: column;
+          }
+
           .rmfa-copy-all,
           .rmfa-refresh,
+          .rmfa-apply-filter,
           .rmfa-copy-user {
             flex: 1;
           }
@@ -1198,7 +1518,8 @@
       this.settingsStore = new SettingsStore();
       this.apiClient = new ApiClient();
       this.domFallbackClient = new DomFallbackClient();
-      this.activityService = new UserActivityService(this.apiClient, this.domFallbackClient);
+      this.subscriptionFilterService = new SubscriptionFilterService(this.apiClient);
+      this.activityService = new UserActivityService(this.apiClient, this.domFallbackClient, this.subscriptionFilterService);
       this.panel = new ActivityPanel(this.settingsStore);
       this.lastUrl = '';
       this.isRefreshing = false;
@@ -1240,7 +1561,8 @@
       try {
         const slug = this.detector.getSlug();
         const postId = this.detector.getPostId();
-        const data = await this.activityService.load(article, slug, postId);
+        const profileIds = this.settingsStore.getSubscriptionProfileParseResult().ids;
+        const data = await this.activityService.load(article, slug, postId, profileIds);
         this.panel.setData(data);
       } catch (error) {
         console.warn('[RMFA] Ошибка загрузки активности', error);
